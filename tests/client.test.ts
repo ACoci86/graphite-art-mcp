@@ -32,9 +32,9 @@ function waitClose(socket: FakeBridge): Promise<number> {
 }
 
 beforeEach(async () => {
-	port = 47_900 + Math.floor(Math.random() * 500);
-	client = new GraphiteClient({ host: "127.0.0.1", port, token: TOKEN, allowedOrigins: [], requestTimeoutMs: 300, log: () => undefined });
+	client = new GraphiteClient({ host: "127.0.0.1", port: 0, token: TOKEN, allowedOrigins: [], requestTimeoutMs: 300, log: () => undefined });
 	await client.listen();
+	port = client.port;
 });
 
 afterEach(async () => {

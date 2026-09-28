@@ -113,11 +113,11 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 3000): Promise<vo
 }
 
 beforeEach(async () => {
-	port = 49_000 + Math.floor(Math.random() * 500);
+	client = new GraphiteClient({ host: "127.0.0.1", port: 0, token: TOKEN, allowedOrigins: [], requestTimeoutMs: 2000, log: () => undefined });
+	await client.listen();
+	port = client.port;
 	localStorage.setItem("graphiteAutomationToken", TOKEN);
 	localStorage.setItem("graphiteAutomationEndpoint", `ws://127.0.0.1:${port}`);
-	client = new GraphiteClient({ host: "127.0.0.1", port, token: TOKEN, allowedOrigins: [], requestTimeoutMs: 2000, log: () => undefined });
-	await client.listen();
 });
 
 afterEach(async () => {

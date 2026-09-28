@@ -50,6 +50,7 @@ export interface BridgeInfo {
 export class GraphiteClient {
 	private readonly options: GraphiteClientOptions;
 	private server: WebSocketServer | null = null;
+	private boundPort: number | null = null;
 	private socket: WebSocket | null = null;
 	private bridgeInfo: BridgeInfo | null = null;
 	private readonly pending = new Map<string, Pending>();
@@ -64,7 +65,9 @@ export class GraphiteClient {
 			const server = new WebSocketServer({ host: this.options.host, port: this.options.port, verifyClient: (info: { req: IncomingMessage }) => this.verifyClient(info.req) });
 			server.on("listening", () => {
 				this.server = server;
-				this.options.log(`listening on ws://${this.options.host}:${this.options.port}`);
+				const address = server.address();
+				this.boundPort = typeof address === "object" && address ? address.port : this.options.port;
+				this.options.log(`listening on ws://${this.options.host}:${this.boundPort}`);
 				resolve();
 			});
 			server.on("error", (error) => reject(error));
@@ -82,6 +85,12 @@ export class GraphiteClient {
 		this.socket = null;
 		await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
 		this.server = null;
+		this.boundPort = null;
+	}
+
+	/** The port actually bound (differs from the configured one only when it was 0, meaning "any free port"). */
+	get port(): number {
+		return this.boundPort ?? this.options.port;
 	}
 
 	get connected(): boolean {

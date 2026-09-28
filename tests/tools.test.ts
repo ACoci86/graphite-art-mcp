@@ -43,10 +43,9 @@ function parseError(result: Awaited<ReturnType<Client["callTool"]>>): { code: st
 
 beforeEach(async () => {
 	tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "graphite-mcp-test-"));
-	port = 48_400 + Math.floor(Math.random() * 500);
 	const config: Config = {
 		host: "127.0.0.1",
-		port,
+		port: 0,
 		token: TOKEN,
 		tokenSource: "env",
 		tokenWasGenerated: false,
@@ -68,6 +67,7 @@ beforeEach(async () => {
 	};
 	mcp = createGraphiteMcp(config, () => undefined);
 	await mcp.client.listen();
+	port = mcp.client.port;
 
 	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 	await mcp.server.connect(serverTransport);
