@@ -81,9 +81,11 @@ transport.stderr?.on("data", (chunk) => process.stderr.write(`    [connector] ${
 const client = new Client({ name: "graphite-e2e", version: "0.0.0" });
 await client.connect(transport);
 
-// Chromium flags: Graphite renders through WebGPU. On machines without a GPU (CI runners) Chromium needs its software
-// adapter; override with GRAPHITE_E2E_CHROMIUM_ARGS (space separated) to experiment.
-const chromiumArgs = (process.env.GRAPHITE_E2E_CHROMIUM_ARGS ?? "--enable-unsafe-webgpu --enable-unsafe-swiftshader --use-webgpu-adapter=swiftshader --use-angle=swiftshader --enable-features=Vulkan").split(/\s+/).filter(Boolean);
+// Chromium flags. Graphite renders through WebGPU when an adapter exists and falls back to the CPU when none does.
+// Chromium's software WebGPU adapter (SwiftShader) cannot map buffers on GPU-less CI runners and crashes Graphite, so
+// the test disables WebGPU and exercises the CPU path, which is deterministic everywhere. Override with
+// GRAPHITE_E2E_CHROMIUM_ARGS (space separated) to test a GPU path locally.
+const chromiumArgs = (process.env.GRAPHITE_E2E_CHROMIUM_ARGS ?? "--disable-features=WebGPU --disable-webgpu").split(/\s+/).filter(Boolean);
 console.log(`chromium args: ${chromiumArgs.join(" ") || "(none)"}`);
 const browser = await chromium.launch({ headless: !headed, args: chromiumArgs });
 const page = await browser.newPage();
