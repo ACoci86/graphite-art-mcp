@@ -14,9 +14,17 @@ would for manual edits.
 
 ## Installation
 
+### Claude Desktop: one file
+
+Download `graphite-art-mcp-<version>.mcpb` from the [latest release](https://github.com/ACoci86/graphite-art-mcp/releases/latest)
+and open it. Claude Desktop installs the extension, shows its settings (export folder, whether to open Graphite
+automatically, an optional fonts folder), and runs it with its own Node runtime. Nothing else is required.
+
+### Any MCP client: one line
+
 The only prerequisite is Node.js 20 or newer.
 
-Claude Desktop (Settings, Developer, Edit Config):
+Claude Desktop, if you prefer the config file (Settings, Developer, Edit Config):
 
 ```json
 {
@@ -233,11 +241,14 @@ MCP client. The Release workflow runs it against the bundle it just built before
 2. Push a tag `vX.Y.Z`.
 
 The Release workflow checks out Graphite at the pinned commit, applies the patch, builds the web app, attaches
-`graphite-web.tar.gz` and its SHA-256 to the GitHub release, and publishes the package to npm when an `NPM_TOKEN`
-repository secret is configured. The connector downloads the asset matching its own version on first run.
+`graphite-web.tar.gz` and its SHA-256 to the GitHub release together with the `.mcpb` extension, and publishes the
+package to npm when an `NPM_TOKEN` repository secret is configured. The connector downloads the asset matching its own version on first run.
 
 To move to a newer Graphite commit, update `GRAPHITE_COMMIT` in `.github/workflows/release.yml`, re-apply and re-test
 the patch, and publish a release.
+
+`npm run extension` builds the Claude Desktop extension into `build/`. The manifest is generated from `package.json`
+and the server's own tool list, so it cannot drift from the code.
 
 For a manual end-to-end check with a connected Graphite, ask the client:
 

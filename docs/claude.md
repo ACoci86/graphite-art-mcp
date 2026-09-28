@@ -8,7 +8,12 @@ formats change over time; the authoritative references are:
 
 ## Quick setup (recommended)
 
-### Claude Desktop
+### Claude Desktop: install the extension
+
+Download the `.mcpb` file from the latest GitHub release and open it. Claude Desktop installs it and shows a settings
+panel; the defaults work. Skip the rest of this section unless you prefer the config file.
+
+### Claude Desktop: config file
 
 Edit the config file (Settings → Developer → Edit Config), e.g.
 `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or
