@@ -68,7 +68,7 @@ jobs:
 
       # Graphite's production build generates a third-party licence file with `cargo about`
       - name: Install cargo-about
-        run: cargo install cargo-about --locked
+        run: cargo install cargo-about --locked --features cli
 
       - name: Build the web app (release)
         env:
