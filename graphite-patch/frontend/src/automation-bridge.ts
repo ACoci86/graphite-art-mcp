@@ -1,0 +1,571 @@
+/**
+ * Automation bridge for the graphite-art-mcp connector.
+ *
+ * Inert unless enabled: the page must be loaded with `?automation=<token>` (the token is then remembered in
+ * `localStorage.graphiteAutomationToken`), or `localStorage.graphiteAutomationToken` must already be set.
+ * When enabled, the tab connects to the connector's localhost WebSocket, authenticates with the token, and services
+ * a closed whitelist of commands by calling the `automation*` wrapper functions in `editor_commands.rs`.
+ *
+ * The bridge never drives the GUI. Every command becomes a normal editor message; it observes the resulting
+ * `FrontendMessage`s (via `intercept`, wired in App.svelte) to learn the ids Graphite allocated and to capture export bytes.
+ */
+
+import type { EditorWrapper, FrontendMessage, FileType, LayerStructureEntry } from "/wrapper/pkg/graphite_wasm_wrapper";
+
+const BRIDGE_VERSION = "0.2.0";
+const PROTOCOL_VERSION = 1;
+const DEFAULT_ENDPOINT = "ws://127.0.0.1:47832";
+const TOKEN_STORAGE_KEY = "graphiteAutomationToken";
+const ENDPOINT_STORAGE_KEY = "graphiteAutomationEndpoint";
+/** Wait for simple commands (new document) and the floor for insert_svg. */
+const WAIT_TIMEOUT_MS = 10_000;
+/**
+ * Graphite turns every SVG element into its own layer, and the layer-structure update that confirms the insert only
+ * arrives once all of them exist. Measured at roughly 30 ms per element on a 500-element file, so the insert wait
+ * grows with the element count instead of being a fixed 10 s (which used to be reported as INVALID_SVG).
+ */
+const INSERT_MS_PER_ELEMENT = 40;
+const MAX_WAIT_MS = 120_000;
+const EXPORT_TIMEOUT_MS = 55_000;
+const RECONNECT_MS = 2_000;
+
+const COMMANDS = [
+	"get_capabilities",
+	"new_document",
+	"insert_svg",
+	"export",
+	"get_document",
+	"select_document",
+	"set_fill",
+	"set_stroke",
+	"set_opacity",
+	"set_transform",
+	"delete_layer",
+	"rename_layer",
+	"undo",
+	"redo",
+] as const;
+/** Wait for a structural confirmation (layer removed, document switched). */
+const EDIT_TIMEOUT_MS = 5_000;
+const HEX_COLOR = /^#?[0-9a-f]{6}([0-9a-f]{2})?$/i;
+type CommandName = (typeof COMMANDS)[number];
+
+type FileTypeName = "Svg" | "Png" | "Jpg" | "Webp" | "Tiff" | "Bmp" | "Tga" | "Ico";
+const FILE_TYPE_BY_FORMAT: Record<string, FileTypeName> = { svg: "Svg", png: "Png", jpg: "Jpg", webp: "Webp", tiff: "Tiff", bmp: "Bmp", tga: "Tga", ico: "Ico" };
+
+class BridgeError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+		readonly details?: unknown,
+	) {
+		super(message);
+	}
+}
+
+type Waiter = { predicate: (type: string, data: Record<string, unknown>) => unknown; resolve: (value: unknown) => void };
+
+export interface AutomationBridge {
+	/** Called for every FrontendMessage before the subscriptions router sees it. Returns true to swallow the message. */
+	intercept(messageType: string, messageData: FrontendMessage): boolean;
+	/** Hands the bridge the editor handle; starts connecting if enabled. */
+	attach(editor: EditorWrapper): void;
+	/** Tears down the socket (HMR / unmount). */
+	destroy(): void;
+	readonly enabled: boolean;
+}
+
+export function createAutomationBridge(): AutomationBridge {
+	const token = readToken();
+	const endpoint = readEndpoint();
+	if (!token) return inertBridge();
+
+	let editor: EditorWrapper | undefined;
+	let socket: WebSocket | undefined;
+	let reconnectTimer: number | undefined;
+	let destroyed = false;
+
+	// --- observed editor state ----------------------------------------------------------------------------------------
+	let activeDocumentId: bigint | undefined;
+	const openDocuments = new Map<bigint, { name: string }>();
+	let layerIds = new Set<bigint>();
+	/** Parent id per layer as reported by the last layer-structure update (undefined = document root). */
+	let layerParents = new Map<bigint, bigint | undefined>();
+	/** Per-layer details Graphite streams for the Layers panel: name, kind, visibility. */
+	const layerDetails = new Map<bigint, { name: string; kind: string; visible: boolean }>();
+	const waiters = new Set<Waiter>();
+	/** While set, the next TriggerSaveFile belongs to us and must not be downloaded by the normal handler. */
+	let pendingExport: { resolve: (file: { name: string; content: Uint8Array }) => void } | undefined;
+	/**
+	 * Base names of exports whose wait expired. If Graphite finishes one of them later, the file is swallowed once
+	 * instead of popping a browser download the caller never asked for.
+	 */
+	const staleExports = new Set<string>();
+
+	const collectLayerIds = (entries: LayerStructureEntry[], into: Set<bigint>, parents?: Map<bigint, bigint | undefined>, parent?: bigint): void => {
+		for (const entry of entries) {
+			const id = BigInt(entry.layerId as unknown as bigint | number | string);
+			into.add(id);
+			parents?.set(id, parent);
+			if (entry.children?.length) collectLayerIds(entry.children, into, parents, id);
+		}
+	};
+
+	const observe = (type: string, data: Record<string, unknown>): void => {
+		switch (type) {
+			case "UpdateActiveDocument":
+				activeDocumentId = BigInt(data.documentId as bigint);
+				break;
+			case "UpdateOpenDocumentsList": {
+				openDocuments.clear();
+				for (const doc of data.openDocuments as Array<{ id: bigint; name: string }>) openDocuments.set(BigInt(doc.id), { name: doc.name });
+				break;
+			}
+			case "UpdateDocumentLayerStructure": {
+				const next = new Set<bigint>();
+				const parents = new Map<bigint, bigint | undefined>();
+				collectLayerIds(data.layerStructure as LayerStructureEntry[], next, parents);
+				layerIds = next;
+				layerParents = parents;
+				break;
+			}
+			case "UpdateDocumentLayerDetails": {
+				const entry = data.data as { id: bigint | number | string; alias?: string; implementationName?: string; visible?: boolean } | undefined;
+				if (entry && entry.id !== undefined) {
+					layerDetails.set(BigInt(entry.id), { name: entry.alias || entry.implementationName || "", kind: entry.implementationName ?? "", visible: entry.visible !== false });
+				}
+				break;
+			}
+		}
+		for (const waiter of [...waiters]) {
+			const value = waiter.predicate(type, data);
+			if (value !== undefined) {
+				waiters.delete(waiter);
+				waiter.resolve(value);
+			}
+		}
+	};
+
+	const waitFor = <T>(predicate: (type: string, data: Record<string, unknown>) => T | undefined, timeoutMs: number, timeoutError: BridgeError): Promise<T> =>
+		new Promise<T>((resolve, reject) => {
+			const waiter: Waiter = { predicate, resolve: (value) => resolve(value as T) };
+			const timer = window.setTimeout(() => {
+				waiters.delete(waiter);
+				reject(timeoutError);
+			}, timeoutMs);
+			waiter.resolve = (value) => {
+				window.clearTimeout(timer);
+				resolve(value as T);
+			};
+			waiters.add(waiter);
+		});
+
+	// --- command handlers -----------------------------------------------------------------------------------------------
+	const requireEditor = (): EditorWrapper => {
+		if (!editor) throw new BridgeError("GRAPHITE_NOT_CONNECTED", "The editor handle is not attached yet.");
+		if (editor.hasCrashed()) throw new BridgeError("GRAPHITE_CRASHED", "The Graphite editor has crashed; reload the tab.");
+		return editor;
+	};
+
+	const requireExistingLayer = (value: unknown): bigint => {
+		const layerId = requireBigInt(value, "layer_id");
+		if (activeDocumentId === undefined) throw new BridgeError("NO_ACTIVE_DOCUMENT", "No document is open in Graphite.");
+		if (!layerIds.has(layerId)) throw new BridgeError("LAYER_NOT_FOUND", `Layer ${layerId} was not found in the active document.`);
+		return layerId;
+	};
+
+	const handlers: Record<CommandName, (params: Record<string, unknown>) => Promise<unknown>> = {
+		async get_capabilities() {
+			return { protocol_version: PROTOCOL_VERSION, bridge_version: BRIDGE_VERSION, graphite_commit: graphiteCommitOf(editor), commands: [...COMMANDS] };
+		},
+
+		async new_document(params) {
+			const name = requireString(params.name, "name");
+			const wrapper = requireEditor();
+			const before = activeDocumentId;
+			const wait = waitFor(
+				(type, data) => (type === "UpdateActiveDocument" && BigInt(data.documentId as bigint) !== before ? BigInt(data.documentId as bigint) : undefined),
+				WAIT_TIMEOUT_MS,
+				new BridgeError("BRIDGE_TIMEOUT", "Graphite did not activate a new document in time."),
+			);
+			wrapper.automationNewDocument(name);
+			const documentId = await wait;
+			return { document_id: documentId.toString(), name: openDocuments.get(documentId)?.name ?? name };
+		},
+
+		async get_document() {
+			requireEditor();
+			if (activeDocumentId === undefined) throw new BridgeError("NO_ACTIVE_DOCUMENT", "No document is open in Graphite.");
+			return {
+				document_id: activeDocumentId.toString(),
+				name: openDocuments.get(activeDocumentId)?.name ?? null,
+				layer_count: layerIds.size,
+				layer_ids: [...layerIds].map((id) => id.toString()),
+				layers: [...layerIds].map((id) => {
+					const details = layerDetails.get(id);
+					const parent = layerParents.get(id);
+					return { id: id.toString(), name: details?.name ?? null, kind: details?.kind ?? null, visible: details?.visible ?? true, parent_id: parent === undefined ? null : parent.toString() };
+				}),
+				open_documents: [...openDocuments].map(([id, doc]) => ({ document_id: id.toString(), name: doc.name })),
+			};
+		},
+
+		async select_document(params) {
+			const documentId = requireBigInt(params.document_id, "document_id");
+			const wrapper = requireEditor();
+			if (!openDocuments.has(documentId)) throw new BridgeError("DOCUMENT_NOT_FOUND", `Document ${documentId} is not open.`);
+			if (activeDocumentId === documentId) return { document_id: documentId.toString(), name: openDocuments.get(documentId)?.name ?? null };
+			const wait = waitFor(
+				(type, data) => (type === "UpdateActiveDocument" && BigInt(data.documentId as bigint) === documentId ? true : undefined),
+				EDIT_TIMEOUT_MS,
+				new BridgeError("BRIDGE_TIMEOUT", "Graphite did not switch documents in time."),
+			);
+			wrapper.selectDocument(documentId);
+			await wait;
+			return { document_id: documentId.toString(), name: openDocuments.get(documentId)?.name ?? null };
+		},
+
+		async set_fill(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const color = optionalColor(params.color);
+			requireEditor().automationSetFill(layerId, color);
+			return { layer_id: layerId.toString() };
+		},
+
+		async set_stroke(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const color = optionalColor(params.color);
+			const weight = requireNumber(params.weight ?? 1, "weight");
+			if (weight < 0) throw new BridgeError("INVALID_PARAMS", '"weight" must not be negative.');
+			requireEditor().automationSetStroke(layerId, color, weight);
+			return { layer_id: layerId.toString() };
+		},
+
+		async set_opacity(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const opacity = requireNumber(params.opacity, "opacity");
+			if (opacity < 0 || opacity > 1) throw new BridgeError("INVALID_PARAMS", '"opacity" must be between 0 and 1.');
+			requireEditor().automationSetOpacity(layerId, opacity);
+			return { layer_id: layerId.toString() };
+		},
+
+		async set_transform(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const matrix = params.matrix;
+			if (!Array.isArray(matrix) || matrix.length !== 6 || !matrix.every((n) => typeof n === "number" && Number.isFinite(n))) {
+				throw new BridgeError("INVALID_TRANSFORM", '"matrix" must be six finite numbers [a, b, c, d, e, f].');
+			}
+			const [a, b, c, d, e, f] = matrix as [number, number, number, number, number, number];
+			requireEditor().automationSetTransform(layerId, a, b, c, d, e, f, Boolean(params.replace));
+			return { layer_id: layerId.toString() };
+		},
+
+		async delete_layer(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const wrapper = requireEditor();
+			const wait = waitFor(
+				(type, data) => {
+					if (type !== "UpdateDocumentLayerStructure") return undefined;
+					const ids = new Set<bigint>();
+					collectLayerIds(data.layerStructure as LayerStructureEntry[], ids);
+					return ids.has(layerId) ? undefined : true;
+				},
+				EDIT_TIMEOUT_MS,
+				new BridgeError("BRIDGE_TIMEOUT", `Graphite still lists layer ${layerId} after ${EDIT_TIMEOUT_MS} ms; check get_document.`),
+			);
+			wrapper.automationDeleteLayer(layerId);
+			await wait;
+			return { layer_id: layerId.toString(), deleted: true };
+		},
+
+		async rename_layer(params) {
+			const layerId = requireExistingLayer(params.layer_id);
+			const name = requireString(params.name, "name");
+			requireEditor().automationRenameLayer(layerId, name);
+			return { layer_id: layerId.toString(), name };
+		},
+
+		async undo() {
+			requireEditor().automationUndo();
+			return { ok: true };
+		},
+
+		async redo() {
+			requireEditor().automationRedo();
+			return { ok: true };
+		},
+
+		async insert_svg(params) {
+			const svg = requireString(params.svg, "svg");
+			const x = requireNumber(params.x ?? 0, "x");
+			const y = requireNumber(params.y ?? 0, "y");
+			const center = Boolean(params.center);
+			const layerId = requireBigInt(params.layer_id, "layer_id");
+			const parentId = params.parent_id === undefined ? undefined : requireBigInt(params.parent_id, "parent_id");
+			const name = params.name === undefined ? undefined : requireString(params.name, "name");
+			const requestedTimeout = optionalNumber(params.timeout_ms, "timeout_ms");
+
+			const elementCount = validateSvg(svg);
+			const wrapper = requireEditor();
+			if (activeDocumentId === undefined) throw new BridgeError("NO_ACTIVE_DOCUMENT", "No document is open in Graphite. Create one first.");
+			if (parentId !== undefined && !layerIds.has(parentId)) throw new BridgeError("LAYER_NOT_FOUND", `Layer ${parentId} was not found in the active document.`);
+
+			const timeoutMs = clampTimeout(requestedTimeout ?? WAIT_TIMEOUT_MS + INSERT_MS_PER_ELEMENT * elementCount);
+			const wait = waitFor(
+				(type, data) => {
+					if (type !== "UpdateDocumentLayerStructure") return undefined;
+					const ids = new Set<bigint>();
+					collectLayerIds(data.layerStructure as LayerStructureEntry[], ids);
+					return ids.has(layerId) ? true : undefined;
+				},
+				timeoutMs,
+				new BridgeError(
+					"BRIDGE_TIMEOUT",
+					`Graphite has not reported layer ${layerId} after ${timeoutMs} ms (${elementCount} SVG elements). ` +
+						"The markup parsed correctly, so Graphite may still be building the layer: call get_document and look for this layer_id before retrying, " +
+						"or pass a larger timeout_ms. Retrying blindly can insert the artwork twice.",
+					{ layer_id: layerId.toString(), elements: elementCount, timeout_ms: timeoutMs },
+				),
+			);
+			wrapper.automationInsertSvg(layerId, svg, x, y, center, parentId, name);
+			try {
+				await wait;
+			} catch (error) {
+				// The structure update can land between the timer firing and the rejection being observed
+				if (!layerIds.has(layerId)) throw error;
+			}
+			return { layer_id: layerId.toString(), document_id: activeDocumentId?.toString() ?? null };
+		},
+
+		async export(params) {
+			const format = requireString(params.format, "format").toLowerCase();
+			const fileType = FILE_TYPE_BY_FORMAT[format];
+			if (!fileType) throw new BridgeError("UNSUPPORTED_FORMAT", `Unsupported export format "${format}".`);
+			const scaleFactor = requireNumber(params.scale_factor ?? 1, "scale_factor");
+			const name = requireString(params.name, "name");
+			const timeoutMs = clampTimeout(optionalNumber(params.timeout_ms, "timeout_ms") ?? EXPORT_TIMEOUT_MS);
+			const wrapper = requireEditor();
+			if (activeDocumentId === undefined) throw new BridgeError("NO_ACTIVE_DOCUMENT", "No document is open in Graphite.");
+			if (layerIds.size === 0) throw new BridgeError("EXPORT_FAILED", "The active document has no layers, so there is nothing to export. Insert artwork first.");
+			if (pendingExport) throw new BridgeError("EXPORT_FAILED", "Another export is still in progress.");
+
+			const layerCount = layerIds.size;
+			const file = await new Promise<{ name: string; content: Uint8Array }>((resolve, reject) => {
+				const timer = window.setTimeout(() => {
+					pendingExport = undefined;
+					staleExports.add(name);
+					reject(
+						new BridgeError(
+							"BRIDGE_TIMEOUT",
+							`Graphite did not finish the ${format} export within ${timeoutMs} ms. The document has ${layerCount} layers and the first raster render of a large document can be slow. ` +
+								"Retry the export or raise GRAPHITE_MCP_EXPORT_TIMEOUT_MS; if the render finishes later its file is discarded, not downloaded.",
+							{ timeout_ms: timeoutMs, layer_count: layerCount },
+						),
+					);
+				}, timeoutMs);
+				pendingExport = {
+					resolve: (result) => {
+						window.clearTimeout(timer);
+						pendingExport = undefined;
+						resolve(result);
+					},
+				};
+				wrapper.automationExport(name, fileType as FileType, scaleFactor);
+			});
+
+			return { file_name: file.name, format, content_base64: toBase64(file.content), byte_length: file.content.byteLength };
+		},
+	};
+
+	// --- socket lifecycle -----------------------------------------------------------------------------------------------
+	const send = (frame: unknown): void => {
+		if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+	};
+
+	const onRequest = async (raw: string): Promise<void> => {
+		let request: { id?: unknown; command?: unknown; params?: unknown };
+		try {
+			request = JSON.parse(raw);
+		} catch {
+			return;
+		}
+		const id = typeof request.id === "string" ? request.id : undefined;
+		if (!id) return;
+		const command = request.command as CommandName;
+		if (!COMMANDS.includes(command)) {
+			send({ id, ok: false, error: { code: "UNKNOWN_COMMAND", message: `"${String(request.command)}" is not an automation command.` } });
+			return;
+		}
+		try {
+			const result = await handlers[command]((request.params ?? {}) as Record<string, unknown>);
+			send({ id, ok: true, result });
+		} catch (error) {
+			const body = error instanceof BridgeError ? { code: error.code, message: error.message, details: error.details } : { code: "UNEXPECTED", message: String(error) };
+			send({ id, ok: false, error: body });
+		}
+	};
+
+	const connect = (): void => {
+		if (destroyed || !editor) return;
+		try {
+			socket = new WebSocket(endpoint);
+		} catch (error) {
+			console.warn("[automation-bridge] cannot open socket:", error);
+			scheduleReconnect();
+			return;
+		}
+		socket.onopen = () => {
+			send({ type: "hello", token, protocol_version: PROTOCOL_VERSION, bridge_version: BRIDGE_VERSION, graphite_commit: graphiteCommitOf(editor) });
+			console.info(`[automation-bridge] connected to ${endpoint}`);
+		};
+		socket.onmessage = (event) => void onRequest(String(event.data));
+		socket.onclose = (event) => {
+			// 4003 = bad token, 4004 = protocol mismatch: retrying will not help
+			if (event.code === 4003 || event.code === 4004) {
+				console.error(`[automation-bridge] connector rejected this tab (${event.code} ${event.reason}). Fix the token or update the connector, then reload.`);
+				return;
+			}
+			scheduleReconnect();
+		};
+		socket.onerror = () => {
+			/* onclose follows and handles the retry */
+		};
+	};
+
+	const scheduleReconnect = (): void => {
+		if (destroyed) return;
+		window.clearTimeout(reconnectTimer);
+		reconnectTimer = window.setTimeout(connect, RECONNECT_MS);
+	};
+
+	return {
+		enabled: true,
+		intercept(messageType, messageData) {
+			const data = normalize(messageData);
+			if (messageType === "TriggerSaveFile") {
+				const { name, content } = data as { name: string; content: Uint8Array | number[] };
+				// Capture our own export before the normal handler downloads it
+				if (pendingExport) {
+					pendingExport.resolve({ name, content: content instanceof Uint8Array ? content : new Uint8Array(content) });
+					return true;
+				}
+				// An export whose wait already expired: drop it silently instead of triggering a download
+				const stale = [...staleExports].find((base) => name === base || name.startsWith(`${base}.`));
+				if (stale !== undefined) {
+					staleExports.delete(stale);
+					return true;
+				}
+			}
+			observe(messageType, data);
+			return false;
+		},
+		attach(handle) {
+			editor = handle;
+			connect();
+		},
+		destroy() {
+			destroyed = true;
+			window.clearTimeout(reconnectTimer);
+			socket?.close();
+			socket = undefined;
+		},
+	};
+}
+
+// --- helpers --------------------------------------------------------------------------------------------------------
+
+function inertBridge(): AutomationBridge {
+	return { enabled: false, intercept: () => false, attach: () => undefined, destroy: () => undefined };
+}
+
+function readToken(): string | undefined {
+	try {
+		const fromUrl = new URLSearchParams(window.location.search).get("automation");
+		if (fromUrl) {
+			localStorage.setItem(TOKEN_STORAGE_KEY, fromUrl);
+			// Drop the token from the visible URL so it does not end up in history or screenshots
+			const url = new URL(window.location.href);
+			url.searchParams.delete("automation");
+			window.history.replaceState(null, "", url.toString());
+			return fromUrl;
+		}
+		return localStorage.getItem(TOKEN_STORAGE_KEY) ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function readEndpoint(): string {
+	try {
+		const fromUrl = new URLSearchParams(window.location.search).get("automationEndpoint");
+		if (fromUrl) localStorage.setItem(ENDPOINT_STORAGE_KEY, fromUrl);
+		const value = fromUrl ?? localStorage.getItem(ENDPOINT_STORAGE_KEY) ?? DEFAULT_ENDPOINT;
+		const url = new URL(value);
+		const local = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]";
+		return local && (url.protocol === "ws:" || url.protocol === "wss:") ? value : DEFAULT_ENDPOINT;
+	} catch {
+		return DEFAULT_ENDPOINT;
+	}
+}
+
+function graphiteCommitOf(editor: EditorWrapper | undefined): string | null {
+	try {
+		const hash = editor?.graphiteCommitHash();
+		return hash && hash !== "unknown" ? hash : null;
+	} catch {
+		return null;
+	}
+}
+
+function normalize(message: FrontendMessage): Record<string, unknown> {
+	if (typeof message === "string") return {};
+	const values = Object.values(message as Record<string, unknown>);
+	return (values[0] as Record<string, unknown>) ?? {};
+}
+
+/** Rejects markup Graphite would only complain about in a dialog. Returns the element count, which sizes the insert wait. */
+function validateSvg(svg: string): number {
+	const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+	const parserError = doc.querySelector("parsererror");
+	if (parserError) throw new BridgeError("INVALID_SVG", `The SVG is not well-formed XML: ${parserError.textContent?.trim().split("\n")[0] ?? "parse error"}`);
+	if (doc.documentElement.localName !== "svg") throw new BridgeError("INVALID_SVG", "The root element must be <svg>.");
+	if (doc.querySelector("script")) throw new BridgeError("INVALID_SVG", "Scripts are not allowed inside inserted SVG.");
+	return doc.getElementsByTagName("*").length;
+}
+
+function clampTimeout(ms: number): number {
+	return Math.min(MAX_WAIT_MS, Math.max(500, Math.round(ms)));
+}
+
+/** `null`/`undefined` mean "no colour"; otherwise a 6- or 8-digit hex string, returned without the `#`. */
+function optionalColor(value: unknown): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "string" || !HEX_COLOR.test(value.trim())) throw new BridgeError("INVALID_COLOR", '"color" must be a hex colour like #ff8800 or #ff880080, or null.');
+	return value.trim().replace(/^#/, "").toLowerCase();
+}
+
+function requireString(value: unknown, field: string): string {
+	if (typeof value !== "string") throw new BridgeError("INVALID_PARAMS", `"${field}" must be a string.`);
+	return value;
+}
+
+function requireNumber(value: unknown, field: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) throw new BridgeError("INVALID_PARAMS", `"${field}" must be a finite number.`);
+	return value;
+}
+
+function optionalNumber(value: unknown, field: string): number | undefined {
+	return value === undefined || value === null ? undefined : requireNumber(value, field);
+}
+
+function requireBigInt(value: unknown, field: string): bigint {
+	if (typeof value !== "string" || !/^\d+$/.test(value)) throw new BridgeError("INVALID_PARAMS", `"${field}" must be a decimal string id.`);
+	return BigInt(value);
+}
+
+function toBase64(bytes: Uint8Array): string {
+	let binary = "";
+	const chunk = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+	return btoa(binary);
+}

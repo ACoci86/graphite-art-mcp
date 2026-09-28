@@ -1,0 +1,151 @@
+# Builds the patched Graphite web app once per release and attaches it to the GitHub Release as
+# `graphite-web.tar.gz` (+ `.sha256`). The connector downloads that asset on first run, so end users never need Rust.
+# Then publishes the connector to npm when an NPM_TOKEN secret is configured.
+#
+# Trigger: push a tag `vX.Y.Z` matching `CONNECTOR_VERSION` in src/version.ts (and package.json), or run it by hand.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  # Keep these three in sync with graphite-patch/README.md and the Graphite repository's own pins
+  GRAPHITE_COMMIT: ae321b3409113b238f1482a5ad71cbfff6929602
+  WASM_BINDGEN_CLI_VERSION: "0.2.121"
+  BINARYEN_VERSION: "130"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  graphite-web:
+    name: Build patched Graphite web app
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the connector
+        uses: actions/checkout@v4
+
+      - name: Check out Graphite at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: GraphiteEditor/Graphite
+          ref: ${{ env.GRAPHITE_COMMIT }}
+          path: graphite
+
+      - name: Apply the automation-bridge patch
+        run: git -C graphite apply --verbose ../graphite-patch/automation-bridge.patch
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: graphite/.nvmrc
+
+      - name: Install Rust (stable, wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: graphite
+
+      - name: Install wasm-bindgen-cli and Binaryen wasm-opt
+        run: |
+          if ! wasm-bindgen --version 2>/dev/null | grep -qF "$WASM_BINDGEN_CLI_VERSION"; then
+            cargo install -f "wasm-bindgen-cli@$WASM_BINDGEN_CLI_VERSION"
+          fi
+          BINARYEN_DIR="$HOME/.cache/binaryen-version_$BINARYEN_VERSION"
+          if [ ! -x "$BINARYEN_DIR/bin/wasm-opt" ]; then
+            mkdir -p "$BINARYEN_DIR"
+            curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz" | tar xz -C "$BINARYEN_DIR" --strip-components=1
+          fi
+          echo "$BINARYEN_DIR/bin" >> "$GITHUB_PATH"
+
+      # Graphite's production build generates a third-party licence file with `cargo about`
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked
+
+      - name: Build the web app (release)
+        env:
+          NODE_ENV: production
+          SPLIT_WASM: "1"
+        run: cargo run build web
+        working-directory: graphite
+
+      - name: Package
+        run: |
+          test -f graphite/frontend/dist/index.html
+          tar -czf graphite-web.tar.gz -C graphite/frontend/dist .
+          sha256sum graphite-web.tar.gz | tee graphite-web.tar.gz.sha256
+          ls -la graphite-web.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graphite-web
+          path: |
+            graphite-web.tar.gz
+            graphite-web.tar.gz.sha256
+
+      - name: Attach to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            graphite-web.tar.gz
+            graphite-web.tar.gz.sha256
+          body: |
+            Pre-built Graphite web app (commit `${{ env.GRAPHITE_COMMIT }}` + automation bridge) for graphite-art-mcp ${{ github.ref_name }}.
+            The connector downloads `graphite-web.tar.gz` automatically on first run.
+
+  e2e:
+    name: End-to-end against the built Graphite
+    needs: graphite-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: graphite-web
+          path: bundle
+      - name: Unpack the web app
+        run: mkdir -p graphite-web && tar -xzf bundle/graphite-web.tar.gz -C graphite-web && test -f graphite-web/index.html
+      - name: Install headless Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run the end-to-end test
+        run: npm run e2e -- --web-dir "$PWD/graphite-web" --timeout 180
+
+  npm:
+    name: Publish to npm
+    needs: [graphite-web, e2e]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - name: Check the tag matches the package version
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "${{ github.ref_name }}" ]; then echo "package.json is $PKG but the tag is ${{ github.ref_name }}"; exit 1; fi
+      - name: Publish (skipped when NPM_TOKEN is not configured)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "NPM_TOKEN secret not set; skipping npm publish"; exit 0; fi
+          npm publish --provenance --access public
