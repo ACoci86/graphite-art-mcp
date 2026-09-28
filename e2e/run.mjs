@@ -81,7 +81,11 @@ transport.stderr?.on("data", (chunk) => process.stderr.write(`    [connector] ${
 const client = new Client({ name: "graphite-e2e", version: "0.0.0" });
 await client.connect(transport);
 
-const browser = await chromium.launch({ headless: !headed, args: ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-features=Vulkan"] });
+// Chromium flags: Graphite renders through WebGPU. On machines without a GPU (CI runners) Chromium needs its software
+// adapter; override with GRAPHITE_E2E_CHROMIUM_ARGS (space separated) to experiment.
+const chromiumArgs = (process.env.GRAPHITE_E2E_CHROMIUM_ARGS ?? "--enable-unsafe-webgpu --enable-unsafe-swiftshader --use-webgpu-adapter=swiftshader --use-angle=swiftshader --enable-features=Vulkan").split(/\s+/).filter(Boolean);
+console.log(`chromium args: ${chromiumArgs.join(" ") || "(none)"}`);
+const browser = await chromium.launch({ headless: !headed, args: chromiumArgs });
 const page = await browser.newPage();
 page.on("console", (message) => {
 	if (message.type() === "error" || message.text().includes("automation-bridge")) console.log(`    [browser] ${message.text()}`);
