@@ -59,14 +59,28 @@ export class GraphiteClient {
 		this.options = options;
 	}
 
-	/** Starts listening. Resolves once the port is bound. */
-	listen(): Promise<void> {
+	/**
+	 * Starts listening. Resolves once a port is bound. If the configured port is already taken (typically another
+	 * connector instance run by a second MCP client), falls back to a free port; `port` reports which one.
+	 */
+	async listen(): Promise<void> {
+		try {
+			await this.listenOn(this.options.port);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EADDRINUSE" || this.options.port === 0) throw error;
+			this.options.log(`port ${this.options.port} is already in use (another connector instance?); picking a free port instead`);
+			await this.listenOn(0);
+		}
+	}
+
+	private listenOn(port: number): Promise<void> {
 		return new Promise((resolve, reject) => {
-			const server = new WebSocketServer({ host: this.options.host, port: this.options.port, verifyClient: (info: { req: IncomingMessage }) => this.verifyClient(info.req) });
+			const server = new WebSocketServer({ host: this.options.host, port, verifyClient: (info: { req: IncomingMessage }) => this.verifyClient(info.req) });
 			server.on("listening", () => {
 				this.server = server;
 				const address = server.address();
-				this.boundPort = typeof address === "object" && address ? address.port : this.options.port;
+				this.boundPort = typeof address === "object" && address ? address.port : port;
 				this.options.log(`listening on ws://${this.options.host}:${this.boundPort}`);
 				resolve();
 			});
@@ -110,7 +124,7 @@ export class GraphiteClient {
 		if (!socket || socket.readyState !== WebSocket.OPEN || !this.bridgeInfo) {
 			throw new GraphiteError(
 				"GRAPHITE_NOT_CONNECTED",
-				`No Graphite editor tab is connected to ws://${this.options.host}:${this.options.port}. Open Graphite with the automation bridge enabled and the matching token.`,
+				`No Graphite editor tab is connected to ws://${this.options.host}:${this.port}. Open Graphite with the automation bridge enabled and the matching token.`,
 			);
 		}
 

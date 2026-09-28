@@ -118,17 +118,24 @@ export function startStaticServer(options: StaticServerOptions): Promise<StaticS
 		}
 	});
 
-	return new Promise((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(options.port, options.host, () => {
-			const address = server.address();
-			const port = typeof address === "object" && address ? address.port : options.port;
-			const hostForUrl = options.host.includes(":") ? `[${options.host}]` : options.host;
-			resolve({
-				url: `http://${hostForUrl}:${port}`,
-				port,
-				close: () => new Promise<void>((done) => server.close(() => done())),
+	const listen = (port: number): Promise<StaticServer> =>
+		new Promise((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(port, options.host, () => {
+				server.removeAllListeners("error");
+				const address = server.address();
+				const bound = typeof address === "object" && address ? address.port : port;
+				const hostForUrl = options.host.includes(":") ? `[${options.host}]` : options.host;
+				resolve({
+					url: `http://${hostForUrl}:${bound}`,
+					port: bound,
+					close: () => new Promise<void>((done) => server.close(() => done())),
+				});
 			});
 		});
+	return listen(options.port).catch((error: NodeJS.ErrnoException) => {
+		if (error.code !== "EADDRINUSE" || options.port === 0) throw error;
+		options.log(`web port ${options.port} is already in use; picking a free port instead`);
+		return listen(0);
 	});
 }

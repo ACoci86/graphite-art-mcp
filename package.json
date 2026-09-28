@@ -1,6 +1,6 @@
 {
   "name": "graphite-art-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Unofficial MCP connector for the Graphite graphics editor (graphite.art): typed editing commands for Claude and other MCP clients",
   "license": "MIT",
   "type": "module",

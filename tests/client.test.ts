@@ -42,6 +42,16 @@ afterEach(async () => {
 });
 
 describe("GraphiteClient", () => {
+	it("falls back to a free port when the configured one is taken", async () => {
+		const logs: string[] = [];
+		const second = new GraphiteClient({ host: "127.0.0.1", port: client.port, token: TOKEN, allowedOrigins: [], requestTimeoutMs: 300, log: (m) => logs.push(m) });
+		await second.listen();
+		expect(second.port).not.toBe(client.port);
+		expect(second.port).toBeGreaterThan(0);
+		expect(logs.some((m) => m.includes("already in use"))).toBe(true);
+		await second.close();
+	});
+
 	it("reports not connected before a bridge attaches", async () => {
 		expect(client.connected).toBe(false);
 		await expect(client.request("new_document", { name: "x" })).rejects.toMatchObject({ code: "GRAPHITE_NOT_CONNECTED" });

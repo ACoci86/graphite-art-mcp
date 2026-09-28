@@ -21,10 +21,10 @@ const log = (message: string): void => {
 	process.stderr.write(`[graphite-art-mcp] ${message}\n`);
 };
 
-/** The URL a browser must open to attach a Graphite tab to this connector. */
-export function tabUrl(webUrl: string, config: Config): string {
+/** The URL a browser must open to attach a Graphite tab to this connector. `port` is the socket port actually bound. */
+export function tabUrl(webUrl: string, config: Config, port: number): string {
 	const params = new URLSearchParams({ automation: config.token });
-	if (config.port !== DEFAULT_PORT || config.host !== "127.0.0.1") params.set("automationEndpoint", `ws://${config.host}:${config.port}`);
+	if (port !== DEFAULT_PORT || config.host !== "127.0.0.1") params.set("automationEndpoint", `ws://${config.host}:${port}`);
 	return `${webUrl}/?${params.toString()}`;
 }
 
@@ -32,7 +32,7 @@ async function serveGraphite(config: Config, mcp: GraphiteMcp): Promise<StaticSe
 	try {
 		const webDir = config.webDir ?? (await ensureWebBundle({ url: config.bundleUrl, sha256: config.bundleSha256, cacheDir: config.cacheDir, version: CONNECTOR_VERSION, log }));
 		const web = await startStaticServer({ root: webDir, host: config.host, port: config.webPort, log });
-		const url = tabUrl(web.url, config);
+		const url = tabUrl(web.url, config, mcp.client.port);
 		mcp.runtime.webUrl = url;
 		log(`serving Graphite at ${web.url}; open ${url} to connect a tab (the token is in the URL and is remembered by the tab)`);
 		if (config.openBrowser) {

@@ -30,7 +30,7 @@ export function registerGetCapabilities(server: McpServer, ctx: ToolContext): vo
 		},
 		async () =>
 			run(async () => {
-				const endpoint = `ws://${ctx.config.host}:${ctx.config.port}`;
+				const endpoint = `ws://${ctx.config.host}:${ctx.client.port}`;
 				const tools = [
 					"graphite_get_capabilities",
 					"graphite_new_document",

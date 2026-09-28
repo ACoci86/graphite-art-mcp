@@ -1,4 +1,4 @@
-export const CONNECTOR_VERSION = "0.2.0";
+export const CONNECTOR_VERSION = "0.2.1";
 
 /**
  * GitHub repository that publishes this connector, as `owner/name`. Release builds of the patched Graphite web app are

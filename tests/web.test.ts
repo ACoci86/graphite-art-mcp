@@ -66,6 +66,18 @@ describe("static server", () => {
 		expect(await head.text()).toBe("");
 	});
 
+	it("falls back to a free port when the configured one is taken", async () => {
+		const site = path.join(tmp, "site");
+		await makeSite(site);
+		server = await startStaticServer({ root: site, host: "127.0.0.1", port: 0, log: () => undefined });
+		const logs: string[] = [];
+		const second = await startStaticServer({ root: site, host: "127.0.0.1", port: server.port, log: (m) => logs.push(m) });
+		expect(second.port).not.toBe(server.port);
+		expect((await fetch(`${second.url}/`)).status).toBe(200);
+		expect(logs.some((m) => m.includes("already in use"))).toBe(true);
+		await second.close();
+	});
+
 	it("never resolves outside the root", async () => {
 		const site = path.join(tmp, "site");
 		await makeSite(site);
@@ -146,7 +158,7 @@ describe("config for the served app", () => {
 		expect(a.webPort).toBe(47833);
 		expect(a.openBrowser).toBe(true);
 		expect(a.tokenSource).toBe("generated");
-		expect(a.bundleUrl).toMatch(/releases\/download\/v0\.2\.0\/graphite-web\.tar\.gz$/);
+		expect(a.bundleUrl).toMatch(/releases\/download\/v0\.2\.1\/graphite-web\.tar\.gz$/);
 		// A second load reuses the generated token
 		const b = loadConfig({ GRAPHITE_MCP_CACHE_DIR: cache });
 		expect(b.token).toBe(a.token);
